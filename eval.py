@@ -12,6 +12,46 @@ from torch.autograd import Variable
 import time
 description='Video Super Resolution pytorch implementation'
 
+def chop_forward(x, model, scale, shave=10, min_size=8000, n_GPUs=1):
+    n_GPUs = min(n_GPUs, 4)
+    b, num, c, h, w = x.size()
+    h_half, w_half = h // 2, w // 2
+    h_size, w_size = h_half + shave, w_half + shave
+    inputlist = [
+        x[:, :, :, 0:h_size, 0:w_size],
+        x[:, :, :, 0:h_size, (w - w_size):w],
+        x[:, :, :, (h - h_size):h, 0:w_size],
+        x[:, :, :, (h - h_size):h, (w - w_size):w]]
+
+    if w_size * h_size < min_size:
+        outputlist = []
+        for i in range(0, 4, n_GPUs):
+            input_batch = torch.cat(inputlist[i:(i + n_GPUs)], dim=0)
+            output_batch, _ = model(input_batch)
+            outputlist.extend(output_batch.chunk(n_GPUs, dim=0))
+    else:
+        outputlist = [
+            chop_forward(patch, model, scale, shave, min_size, n_GPUs) \
+            for patch in inputlist]
+
+    h, w = scale * h, scale * w
+    h_half, w_half = scale * h_half, scale * w_half
+    h_size, w_size = scale * h_size, scale * w_size
+    shave *= scale
+
+    output = Variable(x.data.new(b, c, h, w), volatile=True)
+    output[:, :, 0:h_half, 0:w_half] \
+        = outputlist[0][:, :, 0:h_half, 0:w_half]
+    output[:, :, 0:h_half, w_half:w] \
+        = outputlist[1][:, :, 0:h_half, (w_size - w + w_half):w_size]
+    output[:, :, h_half:h, 0:w_half] \
+        = outputlist[2][:, :, (h_size - h + h_half):h_size, 0:w_half]
+    output[:, :, h_half:h, w_half:w] \
+        = outputlist[3][:, :, (h_size - h + h_half):h_size, (w_size - w + w_half):w_size]
+
+    return output
+
+
 def forward_x8(lr, forward_function=None):
         def _transform(v, op):
             v = v.float()
@@ -92,8 +132,10 @@ if not os.path.exists(path):
             os.makedirs(path)
 
 for i in range(len(lis)):
+    if lis[i] == '.DS_Store':
+        continue
     print(lis[i])
-    LR = os.path.join(dir_LR, lis[i], 'LR_bicubic')
+    LR = os.path.join(dir_LR, lis[i])#, 'LR_bicubic')
     ims = sorted(os.listdir(LR))
     num = len(ims)
     # number of the seq
@@ -113,13 +155,14 @@ for i in range(len(lis)):
         frames_lr = frames_lr/255.0 - 0.5
         lr = torch.from_numpy(frames_lr).float().permute(0, 3, 1, 2)
         lr = Variable(lr.cuda()).unsqueeze(0).contiguous()
-        output, _ = model(lr)
+        output = chop_forward(lr, model, args.scale)
+        #output, _ = model(lr)
         #output = forward_x8(lr, model)
         output = (output.data + 0.5)*255
         output = quantize(output, 255)
         output = output.squeeze(dim=0)
         elapsed_time = time.time() - start
-        print(elapsed_time)
+        #print(elapsed_time)
         img_name = os.path.join(os.path.join(path, lis[i]), ims[j])
         if not os.path.exists(os.path.join(path, lis[i])):
             os.makedirs(os.path.join(path, lis[i]))
